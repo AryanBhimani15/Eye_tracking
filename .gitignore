@@ -1,0 +1,48 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+
+# IDE files
+.vscode/
+.idea/
+
+# System files
+FETCH_HEAD
+
+# Build folders
+build/
+dist/
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS Files
+.DS_Store
+
+# IDE Files
+.vscode/
+.idea/
+
+# System Files
+FETCH_HEAD
+
+# Build Files
+build/
+dist/
+*.log
