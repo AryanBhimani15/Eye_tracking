@@ -242,7 +242,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(
     <h1 class="intro-title">See what your<br><em>eyes</em> actually see</h1>
     <p class="intro-sub">A precision gaze study with real calibration. We map your unique eye geometry before tracking—so the heatmaps reflect where you <em>actually</em> looked.</p>
     <div class="steps-row">
-      <div class="step-pill"><strong>01 — Calibrate</strong>Follow 9 dots across the screen. Takes ~20 seconds.</div>
+      <div class="step-pill"><strong>01 — Calibrate</strong>Follow 13 dots across the screen. Takes ~25 seconds.</div>
       <div class="step-pill"><strong>02 — Study</strong>View 4 vehicles for 10s each while we track your gaze.</div>
       <div class="step-pill"><strong>03 — Analyse</strong>See calibrated heatmaps showing your true attention.</div>
     </div>
@@ -357,8 +357,8 @@ const CAL_POINTS_DEF = [
   [.05,.95],[.5,.95],[.95,.95],
   [.25,.25],[.75,.25],[.25,.75],[.75,.75]
 ];
-// Tuned Kalman: more smoothing (higher R = trust prediction more)
-const KALMAN_Q=0.005,KALMAN_R=1.2;
+// Adaptive Kalman — measurement noise shrinks on fixations, grows on saccades
+const KALMAN_Q=0.01, KALMAN_R_MIN=0.8, KALMAN_R_MAX=8.0, SACCADE_PX=60;
 
 let faceMesh=null, faceMeshReady=false;
 let cameraStream=null;
@@ -460,16 +460,20 @@ function onFaceResults(res){
     setupCtx.fill();
   });
 
-  // If in calibration collection phase, collect sample
+  // Blink threshold — rejects closed/half-closed eye frames
+  const EAR_MIN=0.20;
+
+  // If in calibration collection phase, collect sample (reject blinks)
   if(calCollecting && lastLandmarks){
     const f=getGazeFeatures(lastLandmarks);
-    calRawSamples.push({ irisX:f.ix, irisY:f.iy });
+    if(f.ear>EAR_MIN) calRawSamples.push(f);
   }
 
   // If in study phase, compute gaze
   if(studyRunning && calModel){
     const f=getGazeFeatures(lastLandmarks);
-    const [sx,sy]=applyModel(f.ix,f.iy);
+    if(f.ear<=EAR_MIN) return; // hold last position during blink
+    const [sx,sy]=applyModel(f);
     const smoothX=kalmanFilter(kx,sx);
     const smoothY=kalmanFilter(ky,sy);
     updateGazeCursor(smoothX,smoothY);
@@ -481,8 +485,13 @@ function onFaceResults(res){
 // KALMAN FILTER
 // ════════════════════════════════════════
 function kalmanFilter(state,measurement){
+  // Big jumps → saccade: lower R so the filter follows the measurement.
+  // Small jumps → fixation: higher R for tight smoothing against jitter.
+  const jump=Math.abs(measurement-state.x);
+  const t=Math.min(1, jump/SACCADE_PX);
+  const R=KALMAN_R_MIN + (KALMAN_R_MAX-KALMAN_R_MIN)*(1-t);
   state.p+=KALMAN_Q;
-  const K=state.p/(state.p+KALMAN_R);
+  const K=state.p/(state.p+R);
   state.x+=K*(measurement-state.x);
   state.p=(1-K)*state.p;
   return state.x;
@@ -551,19 +560,17 @@ function nextCalPoint(){
     calCollecting=true;
     setTimeout(()=>{
       calCollecting=false;
-      // Store median of collected samples for this point
-      if(calRawSamples.length>0){
-        // Trim outliers: drop top+bottom 20% before median
-        const xs=calRawSamples.map(s=>s.irisX);
-        const ys=calRawSamples.map(s=>s.irisY);
-        const mX=trimmedMean(xs);
-        const mY=trimmedMean(ys);
+      // Median-trim samples per-feature to kill occasional outlier frames
+      if(calRawSamples.length>=4){
+        const trimmed=trimSamples(calRawSamples);
         calPoints[calIndex]={
           screen:[calTargetX,calTargetY],
-          iris:[mX,mY]
+          samples:trimmed,
+          // legacy iris field kept for IDW fallback
+          iris:[medianOf(trimmed,'ix'), medianOf(trimmed,'iy')]
         };
       }else{
-        calPoints[calIndex]={screen:[calTargetX,calTargetY],iris:[null,null]};
+        calPoints[calIndex]={screen:[calTargetX,calTargetY],samples:[],iris:[null,null]};
       }
       calPhase='click';
       // Allow click to proceed
@@ -621,37 +628,38 @@ function drawCalFrame(){
 }
 
 function getGazeFeatures(lm){
-  // Left eye socket corners: 33 (outer), 133 (inner)
-  // Left eye top/bottom: 159, 145
-  // Left iris centre: 468
-  const lOuter=lm[33], lInner=lm[133];
-  const lTop=lm[159],  lBot=lm[145];
-  const lIris=lm[468];
+  const L={outer:lm[33], inner:lm[133], top:lm[159], bot:lm[145], iris:lm[468]};
+  const R={outer:lm[362], inner:lm[263], top:lm[386], bot:lm[374], iris:lm[473]};
 
-  // Right eye socket corners: 362 (outer), 263 (inner)
-  // Right eye top/bottom: 386, 374
-  // Right iris centre: 473
-  const rOuter=lm[362], rInner=lm[263];
-  const rTop=lm[386],   rBot=lm[374];
-  const rIris=lm[473];
+  // Euclidean eye width/height — correct under head tilt
+  const lW=Math.hypot(L.inner.x-L.outer.x, L.inner.y-L.outer.y)||0.001;
+  const lH=Math.hypot(L.top.x-L.bot.x,     L.top.y-L.bot.y)||0.001;
+  const rW=Math.hypot(R.inner.x-R.outer.x, R.inner.y-R.outer.y)||0.001;
+  const rH=Math.hypot(R.top.x-R.bot.x,     R.top.y-R.bot.y)||0.001;
 
-  // Eye width and height in normalised coords
-  const lW=Math.abs(lInner.x-lOuter.x)||0.001;
-  const lH=Math.abs(lTop.y-lBot.y)||0.001;
-  const rW=Math.abs(rInner.x-rOuter.x)||0.001;
-  const rH=Math.abs(rTop.y-rBot.y)||0.001;
+  // Iris offset from eye centre, normalised by eye size
+  const lCx=(L.outer.x+L.inner.x)/2, lCy=(L.top.y+L.bot.y)/2;
+  const rCx=(R.outer.x+R.inner.x)/2, rCy=(R.top.y+R.bot.y)/2;
+  const lgx=(L.iris.x-lCx)/lW, lgy=(L.iris.y-lCy)/lH;
+  const rgx=(R.iris.x-rCx)/rW, rgy=(R.iris.y-rCy)/rH;
 
-  // Iris offset within eye socket [-1..1]
-  // Positive X = looking right, positive Y = looking down
-  const lGazeX=(lIris.x-(lOuter.x+lInner.x)/2)/lW;
-  const lGazeY=(lIris.y-(lTop.y+lBot.y)/2)/lH;
-  const rGazeX=(rIris.x-(rOuter.x+rInner.x)/2)/rW;
-  const rGazeY=(rIris.y-(rTop.y+rBot.y)/2)/rH;
+  // Eye aspect ratio — tiny when blinking
+  const ear=((lH/lW)+(rH/rW))/2;
 
-  // Average both eyes — more robust than single eye
+  // Head pose proxies
+  const nose=lm[1], chin=lm[152], forehead=lm[10];
+  const lTemple=lm[234], rTemple=lm[454];
+  const roll=Math.atan2(R.outer.y-L.outer.y, R.outer.x-L.outer.x);
+  const faceW=Math.hypot(rTemple.x-lTemple.x, rTemple.y-lTemple.y)||0.001;
+  const faceH=Math.hypot(chin.x-forehead.x, chin.y-forehead.y)||0.001;
+  const yaw=(nose.x-(L.outer.x+R.outer.x)/2)/faceW;
+  const pitch=(nose.y-(forehead.y+chin.y)/2)/faceH;
+
   return {
-    ix:(lGazeX+rGazeX)/2,
-    iy:(lGazeY+rGazeY)/2
+    ix:(lgx+rgx)/2, iy:(lgy+rgy)/2,
+    lgx, lgy, rgx, rgy,
+    yaw, pitch, roll,
+    ear
   };
 }
 
@@ -661,26 +669,32 @@ function median(arr){
   return s.length%2?s[m]:(s[m-1]+s[m])/2;
 }
 
-// Trimmed mean: drop outer 25% to kill outlier frames
-function trimmedMean(arr){
-  const s=[...arr].sort((a,b)=>a-b);
-  const cut=Math.floor(s.length*0.25);
-  const trimmed=s.slice(cut,s.length-cut);
-  if(!trimmed.length)return s[Math.floor(s.length/2)];
-  return trimmed.reduce((a,b)=>a+b,0)/trimmed.length;
+function medianOf(samples,key){ return median(samples.map(s=>s[key])); }
+
+// Drop samples whose averaged-gaze is in the outer 20% — removes saccades/off-target frames
+function trimSamples(samples){
+  if(samples.length<5) return samples;
+  const mx=median(samples.map(s=>s.ix));
+  const my=median(samples.map(s=>s.iy));
+  const scored=samples.map(s=>({s, d:(s.ix-mx)**2+(s.iy-my)**2}))
+                      .sort((a,b)=>a.d-b.d);
+  return scored.slice(0, Math.ceil(scored.length*0.8)).map(o=>o.s);
 }
 
 function finishCalibration(){
   cancelAnimationFrame(calAnimFrame);
   calCtx.clearRect(0,0,calCanvas.width,calCanvas.height);
 
-  // Build calibration model from collected data
-  const validPts=calPoints.filter(p=>p&&p.iris&&p.iris[0]!==null);
-  if(validPts.length>=4){
-    calModel=buildPolynomialModel(validPts);
+  const validPts=calPoints.filter(p=>p&&p.samples&&p.samples.length>=4);
+  let rmsPx=null;
+  if(validPts.length>=6){
+    calModel=buildRegressionModel(validPts);
+    rmsPx=calModel.rms;
+  }else if(validPts.length>=2){
+    // Fallback: inverse-distance weighting
+    calModel={type:'idw', pts:validPts.map(p=>({iris:p.iris, screen:p.screen}))};
   }
 
-  // Show quick "all done" flash then go to study
   calCtx.fillStyle='rgba(212,168,83,0.15)';
   calCtx.fillRect(0,0,calCanvas.width,calCanvas.height);
   calCtx.font='bold 32px DM Serif Display,serif';
@@ -689,67 +703,121 @@ function finishCalibration(){
   calCtx.fillText('Calibration complete ✓',calCanvas.width/2,calCanvas.height/2);
   calCtx.font='14px DM Mono,monospace';
   calCtx.fillStyle='rgba(240,237,232,0.4)';
-  calCtx.fillText(`${validPts.length} points captured`,calCanvas.width/2,calCanvas.height/2+36);
+  const msg=rmsPx!=null
+    ? `${validPts.length} points · ~${Math.round(rmsPx)}px residual`
+    : `${validPts.length} points captured`;
+  calCtx.fillText(msg, calCanvas.width/2, calCanvas.height/2+36);
 
   setTimeout(()=>beginStudy(),1400);
 }
 
 // ════════════════════════════════════════
-// GAZE MODEL — Weighted K-Nearest Neighbour
-// No extrapolation possible. Uses inverse-distance weighting
-// in iris space, outputs screen coords. Stable at all edges.
+// GAZE MODEL — Ridge Regression on quadratic + head-pose features
+// Fits screenX = a·φ(f), screenY = b·φ(f) where φ is feature map.
+// Head pose terms (yaw, pitch, roll) let the model compensate for
+// iris-in-socket drift caused by head movement.
 // ════════════════════════════════════════
-function buildPolynomialModel(pts){
-  // Just store the valid calibration points — no matrix ops
-  return { pts: pts.map(p=>({iris:p.iris, screen:p.screen})) };
+// Feature map: [1, lgx, lgy, rgx, rgy, gx², gy², gx·gy, yaw, pitch, roll]
+// 11 features, fit from ~260 samples (13 pts × ~20 samples) — well-posed.
+function featureVec(f){
+  const gx=(f.lgx+f.rgx)/2, gy=(f.lgy+f.rgy)/2;
+  return [1, f.lgx, f.lgy, f.rgx, f.rgy, gx*gx, gy*gy, gx*gy, f.yaw, f.pitch, f.roll];
 }
 
-// Unused but kept for compat
-function leastSquares(X,Y){ return []; }
-function gaussianElimination(A,b){ return []; }
-
-function applyModel(ix,iy){
-  if(!calModel||!calModel.pts||calModel.pts.length<2){
-    return [ix*window.innerWidth, iy*window.innerHeight];
-  }
-  const pts=calModel.pts;
-
-  // Compute distance in iris space to each calibration point
-  const dists=pts.map(p=>{
-    const dx=p.iris[0]-ix, dy=p.iris[1]-iy;
-    return Math.sqrt(dx*dx+dy*dy)+1e-9;
+function buildRegressionModel(pts){
+  const X=[], yX=[], yY=[];
+  pts.forEach(p=>{
+    p.samples.forEach(s=>{
+      X.push(featureVec(s));
+      yX.push(p.screen[0]);
+      yY.push(p.screen[1]);
+    });
   });
+  const lambda=1e-3;
+  const betaX=ridge(X, yX, lambda);
+  const betaY=ridge(X, yY, lambda);
 
-  // If we're extremely close to a calibration point, snap to it
-  const minD=Math.min(...dists);
-  if(minD<0.002){
-    const idx=dists.indexOf(minD);
-    return [...pts[idx].screen];
+  // Training RMS error in pixels
+  let se=0;
+  for(let i=0;i<X.length;i++){
+    const px=dot(X[i],betaX), py=dot(X[i],betaY);
+    se += (px-yX[i])**2 + (py-yY[i])**2;
+  }
+  const rms=Math.sqrt(se/X.length);
+
+  return {type:'ridge', betaX, betaY, rms, pts:pts.map(p=>({iris:p.iris, screen:p.screen}))};
+}
+
+// Ridge regression: β = (XᵀX + λI)⁻¹ Xᵀy.  λ only on non-bias terms.
+function ridge(X, y, lambda){
+  const n=X.length, p=X[0].length;
+  const XtX=Array.from({length:p}, ()=>Array(p).fill(0));
+  const Xty=Array(p).fill(0);
+  for(let i=0;i<n;i++){
+    for(let j=0;j<p;j++){
+      Xty[j] += X[i][j]*y[i];
+      for(let k=0;k<p;k++) XtX[j][k] += X[i][j]*X[i][k];
+    }
+  }
+  for(let j=1;j<p;j++) XtX[j][j] += lambda;
+  return solveLinear(XtX, Xty);
+}
+
+// Gaussian elimination with partial pivoting
+function solveLinear(A, b){
+  const n=A.length;
+  const M=A.map((row,i)=>[...row, b[i]]);
+  for(let i=0;i<n;i++){
+    let mx=i;
+    for(let k=i+1;k<n;k++) if(Math.abs(M[k][i])>Math.abs(M[mx][i])) mx=k;
+    [M[i],M[mx]]=[M[mx],M[i]];
+    if(Math.abs(M[i][i])<1e-12) continue;
+    for(let k=i+1;k<n;k++){
+      const f=M[k][i]/M[i][i];
+      for(let j=i;j<=n;j++) M[k][j] -= f*M[i][j];
+    }
+  }
+  const x=Array(n).fill(0);
+  for(let i=n-1;i>=0;i--){
+    let s=M[i][n];
+    for(let j=i+1;j<n;j++) s -= M[i][j]*x[j];
+    x[i] = Math.abs(M[i][i])<1e-12 ? 0 : s/M[i][i];
+  }
+  return x;
+}
+
+function applyModel(f){
+  if(!calModel) return [f.ix*window.innerWidth, f.iy*window.innerHeight];
+
+  let sx, sy;
+  if(calModel.type==='ridge'){
+    const phi=featureVec(f);
+    sx=dot(phi, calModel.betaX);
+    sy=dot(phi, calModel.betaY);
+  }else{
+    // IDW fallback
+    const pts=calModel.pts, ix=f.ix, iy=f.iy;
+    const dists=pts.map(p=>Math.hypot(p.iris[0]-ix, p.iris[1]-iy)+1e-9);
+    const indexed=dists.map((d,i)=>({d,i})).sort((a,b)=>a.d-b.d);
+    const k=Math.min(5, pts.length);
+    let ws=0, wx=0, wy=0;
+    for(let i=0;i<k;i++){
+      const {d,i:idx}=indexed[i], w=1/(d*d);
+      wx += pts[idx].screen[0]*w;
+      wy += pts[idx].screen[1]*w;
+      ws += w;
+    }
+    sx=wx/ws; sy=wy/ws;
   }
 
-  // Inverse-distance weighting with power=2, use closest 5 points
-  const indexed=dists.map((d,i)=>({d,i})).sort((a,b)=>a.d-b.d);
-  const k=Math.min(5,pts.length);
-  const neighbours=indexed.slice(0,k);
-
-  let wSum=0, wx=0, wy=0;
-  neighbours.forEach(({d,i})=>{
-    const w=1/(d*d);
-    wx+=pts[i].screen[0]*w;
-    wy+=pts[i].screen[1]*w;
-    wSum+=w;
-  });
-
-  const sx=wx/wSum, sy=wy/wSum;
-  // Soft clamp with 5% margin so cursor stays on screen
   const pad=20;
   return [
-    Math.max(pad,Math.min(window.innerWidth-pad,sx)),
-    Math.max(pad,Math.min(window.innerHeight-pad,sy))
+    Math.max(pad, Math.min(window.innerWidth-pad, sx)),
+    Math.max(pad, Math.min(window.innerHeight-pad, sy))
   ];
 }
 
-function dot(a,b){ return a.reduce((s,v,i)=>s+v*b[i],0); }
+function dot(a,b){ let s=0; for(let i=0;i<a.length;i++) s+=a[i]*b[i]; return s; }
 
 // ════════════════════════════════════════
 // STUDY
@@ -1013,8 +1081,9 @@ function recalibrateNow(){
       window.finishCalibration=function(){
         cancelAnimationFrame(calAnimFrame);
         calCtx.clearRect(0,0,calCanvas.width,calCanvas.height);
-        const validPts=calPoints.filter(p=>p&&p.iris&&p.iris[0]!==null);
-        if(validPts.length>=4) calModel=buildPolynomialModel(validPts);
+        const validPts=calPoints.filter(p=>p&&p.samples&&p.samples.length>=4);
+        if(validPts.length>=6) calModel=buildRegressionModel(validPts);
+        else if(validPts.length>=2) calModel={type:'idw', pts:validPts.map(p=>({iris:p.iris, screen:p.screen}))};
         calCtx.fillStyle='rgba(212,168,83,0.1)';
         calCtx.fillRect(0,0,calCanvas.width,calCanvas.height);
         calCtx.font='28px DM Serif Display,serif';
