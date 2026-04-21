@@ -46,3 +46,4 @@ FETCH_HEAD
 build/
 dist/
 *.log
+.claude/
