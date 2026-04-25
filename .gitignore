@@ -6,44 +6,29 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
 
 # Virtual environments
-venv/
-.env/
-
-# IDE files
-.vscode/
-.idea/
-
-# System files
-FETCH_HEAD
-
-# Build folders
-build/
-dist/
-# Virtual Environment
 .venv/
 venv/
 env/
+.env/
 
-# Python Cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# macOS Files
-.DS_Store
-
-# IDE Files
+# IDE
 .vscode/
 .idea/
 
-# System Files
-FETCH_HEAD
-
-# Build Files
+# Test / build artifacts
+.pytest_cache/
 build/
 dist/
 *.log
+
+# Generated heatmaps from eye_tracking_heatmap.py
+output/
+
+# Claude Code workspace
 .claude/
+
+# Misc
+FETCH_HEAD
