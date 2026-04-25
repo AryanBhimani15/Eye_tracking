@@ -55,7 +55,7 @@ def get_cars():
 @app.route('/api/study/start', methods=['POST'])
 def start_study():
     """Initialize a new rapid-fire study session"""
-    data = request.json
+    data = request.get_json(silent=True) or {}
     study_id = datetime.now().strftime('%Y%m%d_%H%M%S_') + os.urandom(4).hex()
 
     study_sessions[study_id] = {
@@ -78,7 +78,9 @@ def start_study():
 @app.route('/api/session/start', methods=['POST'])
 def start_session():
     """Initialize a single vehicle session within a study"""
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    if not data.get('car_id'):
+        return jsonify({'error': 'car_id is required'}), 400
     session_id = datetime.now().strftime('%Y%m%d_%H%M%S_') + os.urandom(4).hex()
 
     sessions[session_id] = {
@@ -107,7 +109,9 @@ def record_gaze(session_id):
     if session_id not in sessions:
         return jsonify({'error': 'Session not found'}), 404
 
-    data = request.json
+    data = request.get_json(silent=True) or {}
+    if data.get('x') is None or data.get('y') is None:
+        return jsonify({'error': 'x and y are required'}), 400
     point = {
         'x': data.get('x'),
         'y': data.get('y'),
@@ -145,9 +149,10 @@ def stop_session(session_id):
     # Calculate comprehensive statistics
     duration = 0
     if points:
-        start_ts = points[0]['timestamp']
-        end_ts = points[-1]['timestamp']
-        duration = (end_ts - start_ts) / 1000
+        start_ts = points[0].get('timestamp')
+        end_ts = points[-1].get('timestamp')
+        if start_ts is not None and end_ts is not None:
+            duration = (end_ts - start_ts) / 1000
 
     # Generate heatmap grid (100x100 for detailed analysis)
     heatmap_grid = generate_heatmap_grid(points)
@@ -411,6 +416,17 @@ def export_study(study_id):
             full_data['vehicles'].append(sessions[session_id])
 
     return jsonify(full_data)
+
+@app.errorhandler(404)
+def not_found(_):
+    return jsonify({'error': 'Not found'}), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    app.logger.exception('Unhandled server error: %s', e)
+    return jsonify({'error': 'Internal server error'}), 500
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
